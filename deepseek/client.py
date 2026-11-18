@@ -25,7 +25,8 @@ import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator, Optional
+import time
+from typing import Iterator, List, Optional, Tuple
 
 import httpx
 
@@ -34,6 +35,8 @@ from .pow import DeepSeekPow
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
+UPLOAD_FILE_PATH = "/api/v0/file/upload_file"
+FETCH_FILES_PATH = "/api/v0/file/fetch_files"
 
 # DeepSeek's mode pill, sent as `model_type` in the completion body. "default" is
 # Instant (the fast model); "expert" is the stronger, slower model. Omitting the
@@ -178,6 +181,63 @@ class DeepSeekClient:
         with self._pow_lock:
             return self._pow.make_header(challenge)
 
+    def upload_file(
+        self,
+        file_bytes: bytes,
+        filename: str = "image.png",
+        mime_type: str = "image/png",
+        thinking: bool = False,
+        model: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> str:
+        """Upload a file/image to DeepSeek and wait until parsing completes.
+        Returns the `file_id` (e.g. 'file-...') to pass in `ref_file_ids`."""
+        pow_hdr = self._pow_header(target_path=UPLOAD_FILE_PATH)
+        headers = dict(self._base_headers())
+        headers.pop("content-type", None)  # let httpx generate multipart boundary
+        headers["x-ds-pow-response"] = pow_hdr
+        headers["x-file-size"] = str(len(file_bytes))
+        headers["x-thinking-enabled"] = "1" if thinking else "0"
+        headers["x-model-type"] = model or DEFAULT_MODEL_TYPE
+
+        token = self.session.token
+        r = httpx.post(
+            f"{BASE}{UPLOAD_FILE_PATH}",
+            headers=headers,
+            cookies=self.session.cookies,
+            files={"file": (filename, file_bytes, mime_type)},
+            timeout=60.0,
+        )
+        if _auth_failed(r):
+            self.refresh_session(stale_token=token)
+            headers["authorization"] = f"Bearer {self.session.token}"
+            r = httpx.post(
+                f"{BASE}{UPLOAD_FILE_PATH}",
+                headers=headers,
+                cookies=self.session.cookies,
+                files={"file": (filename, file_bytes, mime_type)},
+                timeout=60.0,
+            )
+        r.raise_for_status()
+        biz = _biz(r.json())
+        file_id = biz["id"]
+        status = biz.get("status")
+
+        deadline = time.time() + timeout
+        while status in ("PENDING", "PARSING", "PROCESSING") and time.time() < deadline:
+            time.sleep(0.8)
+            rf = self._http.get(f"{FETCH_FILES_PATH}?file_ids={file_id}")
+            rf.raise_for_status()
+            files = _biz(rf.json()).get("files") or []
+            if files:
+                status = files[0].get("status")
+                if status == "FAILED":
+                    raise RuntimeError(
+                        f"DeepSeek failed to process uploaded file {filename} "
+                        f"(error_code={files[0].get('error_code')})"
+                    )
+        return file_id
+
     # --- public API ---------------------------------------------------------
 
     def stream(
@@ -187,6 +247,7 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
+        ref_file_ids: Optional[List[str]] = None,
     ) -> "_Stream":
         """Stream a reply. Iterate it for text chunks; read `.conversation_id`
         afterwards to resume the thread. Pass an existing `conversation_id` to
@@ -211,7 +272,10 @@ class DeepSeekClient:
         else:
             # Resuming: let the existing thread's model stand (send no model_type).
             model_type = None
-        return _Stream(self, prompt, session_id, parent_id, model_type, thinking, search)
+        return _Stream(
+            self, prompt, session_id, parent_id, model_type,
+            thinking, search, ref_file_ids=ref_file_ids,
+        )
 
     def chat(
         self,
@@ -220,10 +284,12 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
+        ref_file_ids: Optional[List[str]] = None,
     ) -> Reply:
         """Return the complete reply (`.text`) plus its `.conversation_id`."""
         s = self.stream(prompt, conversation_id=conversation_id,
-                        model=model, thinking=thinking, search=search)
+                        model=model, thinking=thinking, search=search,
+                        ref_file_ids=ref_file_ids)
         text, reasoning = [], []
         for kind, chunk in s.events():
             if kind == RESPONSE:
@@ -243,8 +309,9 @@ class _Stream:
     the token for resuming the conversation."""
 
     def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
-                 parent_id: Optional[int], model: str,
-                 thinking: bool, search: bool):
+                 parent_id: Optional[int], model: Optional[str],
+                 thinking: bool, search: bool,
+                 ref_file_ids: Optional[List[str]] = None):
         self._client = client
         self._prompt = prompt
         self._session_id = session_id
@@ -252,6 +319,7 @@ class _Stream:
         self._model = model
         self._thinking = thinking
         self._search = search
+        self._ref_file_ids = list(ref_file_ids or [])
         self._message_id: Optional[int] = None
 
     def __iter__(self) -> Iterator[str]:
@@ -266,7 +334,7 @@ class _Stream:
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
             "prompt": self._prompt,
-            "ref_file_ids": [],
+            "ref_file_ids": self._ref_file_ids,
             "thinking_enabled": self._thinking,
             "search_enabled": self._search,
             "action": None,

@@ -41,6 +41,7 @@ from .config import (
 )
 from .openai_format import (
     completion_response,
+    extract_images,
     messages_to_prompt,
     stream_chunks,
     stream_error,
@@ -130,13 +131,30 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
+    # Upload any attached images/files in the messages (OpenAI Vision format).
+    ref_file_ids: list[str] = []
+    try:
+        images = await run_in_threadpool(extract_images, req.messages)
+        for img_bytes, filename, mime_type in images:
+            fid = await run_in_threadpool(
+                client.upload_file,
+                img_bytes,
+                filename,
+                mime_type,
+                req.thinking,
+                model_type,
+            )
+            ref_file_ids.append(fid)
+    except Exception as e:
+        return _error(f"Failed to upload attachment: {e}")
+
     if req.stream:
         # Open the thread before responding, so failures here (bad session,
         # DeepSeek errors) still get a real HTTP status instead of a 200 stream.
         try:
             stream = await run_in_threadpool(
                 client.stream, prompt, req.conversation_id,
-                model_type, req.thinking, req.search,
+                model_type, req.thinking, req.search, ref_file_ids,
             )
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
@@ -157,7 +175,7 @@ async def chat_completions(req: ChatCompletionRequest):
     try:
         reply = await run_in_threadpool(
             client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
+            model_type, req.thinking, req.search, ref_file_ids,
         )
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")

@@ -7,16 +7,32 @@ text output back into OpenAI response/stream objects.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import time
+import urllib.parse
 import uuid
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
+
+import httpx
 
 from deepseek.client import RESPONSE, THINK
 
 from .schemas import ChatMessage
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
+
+_MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+    "application/pdf": ".pdf",
+}
 
 
 def _text_of(content) -> str:
@@ -30,6 +46,54 @@ def _text_of(content) -> str:
         if isinstance(p, dict) and p.get("type") == "text":
             parts.append(p.get("text", ""))
     return "\n".join(parts)
+
+
+def extract_images(messages: List[ChatMessage]) -> List[Tuple[bytes, str, str]]:
+    """Extract images/files from OpenAI multimodal message content parts.
+    Returns a list of `(file_bytes, filename, mime_type)` tuples.
+    Supports `data:<mime>;base64,...` data URLs and `http(s)://` URLs.
+    """
+    attachments: List[Tuple[bytes, str, str]] = []
+    idx = 0
+    for m in messages:
+        if not isinstance(m.content, list):
+            continue
+        for p in m.content:
+            if not isinstance(p, dict):
+                continue
+            ptype = p.get("type")
+            url = None
+            if ptype == "image_url":
+                img_obj = p.get("image_url")
+                url = img_obj.get("url") if isinstance(img_obj, dict) else img_obj
+            elif ptype in ("input_image", "image"):
+                url = p.get("image_url") or p.get("url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+            if not url or not isinstance(url, str):
+                continue
+            idx += 1
+            if url.startswith("data:"):
+                header, _, b64_data = url.partition(",")
+                mime_type = "image/png"
+                if ";" in header:
+                    mime_type = header[5:].split(";")[0] or "image/png"
+                elif len(header) > 5:
+                    mime_type = header[5:]
+                ext = _MIME_TO_EXT.get(mime_type) or mimetypes.guess_extension(mime_type) or ".png"
+                raw = base64.b64decode(b64_data)
+                attachments.append((raw, f"image_{idx}{ext}", mime_type))
+            elif url.startswith(("http://", "https://")):
+                r = httpx.get(url, timeout=30.0, follow_redirects=True)
+                r.raise_for_status()
+                mime_type = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+                parsed_path = urllib.parse.urlparse(url).path
+                ext = _MIME_TO_EXT.get(mime_type) or mimetypes.guess_extension(mime_type) or ".png"
+                name = parsed_path.rsplit("/", 1)[-1] if "/" in parsed_path else ""
+                if not name or "." not in name:
+                    name = f"image_{idx}{ext}"
+                attachments.append((r.content, name, mime_type))
+    return attachments
 
 
 def messages_to_prompt(messages: List[ChatMessage]) -> str:
