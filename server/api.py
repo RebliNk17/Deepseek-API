@@ -12,7 +12,7 @@ Point any OpenAI client at http://localhost:8000/v1 :
 
 Endpoints:
     GET  /v1/models
-    POST /v1/chat/completions   (stream=true supported)
+    POST /v1/chat/completions   (stream=true, tools, and vision supported)
     GET  /healthz
 
 Requests under /v1 are rate limited per client IP (default 30/min, set via
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -43,6 +44,7 @@ from .openai_format import (
     completion_response,
     extract_images,
     messages_to_prompt,
+    parse_tool_calls,
     stream_chunks,
     stream_error,
 )
@@ -81,10 +83,22 @@ def get_client() -> DeepSeekClient:
     return _client
 
 
-def _error(message: str, status: int = 500, err_type: str = "server_error"):
+def _error(
+    message: str,
+    status: int = 500,
+    err_type: str = "server_error",
+    code: Optional[str] = None,
+):
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": err_type}},
+        content={
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": None,
+                "code": code or str(status),
+            }
+        },
     )
 
 
@@ -114,13 +128,20 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(
             f"The model `{req.model}` does not exist. Available models: "
             f"{', '.join(MODEL_MAP)}",
-            status=404, err_type="model_not_found",
+            status=404,
+            err_type="model_not_found",
         )
 
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    has_tools = bool(req.tools and req.tool_choice != "none")
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
+    prompt = messages_to_prompt(
+        req.messages,
+        tools=req.tools if has_tools else None,
+        tool_choice=req.tool_choice,
+    )
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -166,7 +187,13 @@ async def chat_completions(req: ChatCompletionRequest):
             # as an error frame (the OpenAI SDK raises on it) rather than
             # silently dropping the connection.
             try:
-                yield from stream_chunks(req.model, stream)
+                yield from stream_chunks(
+                    req.model,
+                    stream,
+                    prompt=prompt,
+                    has_tools=has_tools,
+                    include_usage=include_usage,
+                )
             except Exception as e:
                 yield from stream_error(f"DeepSeek request failed: {e}")
 
@@ -182,5 +209,12 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id,
-                               reply.reasoning)
+    tool_calls = parse_tool_calls(reply.text) if has_tools else None
+    return completion_response(
+        req.model,
+        reply.text,
+        prompt,
+        reply.conversation_id,
+        reply.reasoning,
+        tool_calls=tool_calls,
+    )
