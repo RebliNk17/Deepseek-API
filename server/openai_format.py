@@ -17,6 +17,7 @@ import ast
 import base64
 import json
 import mimetypes
+import re
 import time
 import urllib.parse
 import uuid
@@ -219,48 +220,122 @@ def _loads_tolerant(blob: str):
         return None
 
 
-def parse_tool_calls(text: str) -> Optional[List[dict]]:
-    """Extract tool calls from the model's raw text output.
+def _parse_dsml_tool_calls(text: str) -> Tuple[Optional[List[dict]], str]:
+    """Parse DeepSeek's native DSML tool-calling format (`<｜DSML｜...>` or `< | DSML | | ...>`)
+    or Anthropic/XML `<function_calls>/<invoke>` blocks.
 
-    Returns OpenAI-style `tool_calls` objects, or `None` when no function-call
-    block is found. Tolerates the model emitting single-quoted / Python-literal
-    output instead of strict JSON.
+    Returns `(tool_calls, cleaned_text_before_calls)`.
     """
-    if not text:
-        return None
+    # Match `<｜DSML｜function_calls>` / `< | | DSML | | calls>` / `<function_calls>`
+    dsml_Token = r"(?:<(?:[\s｜|]*DSML[\s｜|]*)?|\s*<\s*)"
+    end_dsml_Token = r"(?:</(?:[\s｜|]*DSML[\s｜|]*)?|\s*</\s*)"
 
-    blob = _extract_json_object(text)
-    if blob is None:
-        return None
+    invoke_pattern = re.compile(
+        dsml_Token + r'invoke\s+name="([^"]+)"\s*>(.*?)' + end_dsml_Token + r"invoke\s*>",
+        re.DOTALL,
+    )
+    param_pattern = re.compile(
+        dsml_Token
+        + r'parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)'
+        + end_dsml_Token
+        + r"parameter\s*>",
+        re.DOTALL,
+    )
 
-    data = _loads_tolerant(blob)
-    if not isinstance(data, dict):
-        return None
-
-    raw_calls = data.get("tool_calls")
-    if not isinstance(raw_calls, list):
-        return None
+    invokes = list(invoke_pattern.finditer(text))
+    if not invokes:
+        return None, text
 
     result = []
-    for tc in raw_calls:
-        if not isinstance(tc, dict):
-            continue
-        name = tc.get("name")
-        args = tc.get("arguments", {})
-        if not name:
-            continue
-        if isinstance(args, str):
-            args_str = args
-        else:
-            args_str = json.dumps(args, ensure_ascii=False)
+    for inv in invokes:
+        func_name = inv.group(1).strip()
+        body = inv.group(2)
+        args: dict = {}
+        for pm in param_pattern.finditer(body):
+            p_name = pm.group(1).strip()
+            is_str = pm.group(2)
+            p_val_raw = pm.group(3)
+            if is_str == "false":
+                try:
+                    args[p_name] = json.loads(p_val_raw)
+                except Exception:
+                    args[p_name] = p_val_raw
+            else:
+                args[p_name] = p_val_raw
         result.append(
             {
                 "id": "call_" + uuid.uuid4().hex[:8],
                 "type": "function",
-                "function": {"name": name, "arguments": args_str},
+                "function": {
+                    "name": func_name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
             }
         )
-    return result if result else None
+
+    # Strip the `<...calls>...</...calls>` wrapper (or from the first invoke onwards)
+    calls_start = re.search(
+        dsml_Token + r"(?:function_)?calls\s*>",
+        text,
+    )
+    cut_idx = calls_start.start() if calls_start else invokes[0].start()
+    cleaned = text[:cut_idx].strip()
+    return (result if result else None), cleaned
+
+
+def parse_tool_calls_with_text(text: str) -> Tuple[Optional[List[dict]], Optional[str]]:
+    """Extract tool calls and any accompanying assistant text from raw output.
+
+    Supports both:
+    1. Our prompted JSON format: `{"tool_calls": [{"name": ..., "arguments": ...}]}`
+    2. DeepSeek's native DSML format: `<｜DSML｜function_calls><｜DSML｜invoke name="...">...`
+       (including space-separated `< | DSML | | calls>` variants).
+
+    Returns `(tool_calls, remaining_text)`.
+    """
+    if not text:
+        return None, text
+
+    # 1. Check for JSON `{"tool_calls": [...]}`
+    blob = _extract_json_object(text)
+    if blob is not None:
+        data = _loads_tolerant(blob)
+        if isinstance(data, dict) and isinstance(data.get("tool_calls"), list):
+            result = []
+            for tc in data["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                name = tc.get("name")
+                args = tc.get("arguments", {})
+                if not name:
+                    continue
+                args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+                result.append(
+                    {
+                        "id": "call_" + uuid.uuid4().hex[:8],
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_str},
+                    }
+                )
+            if result:
+                idx = text.find(blob)
+                prefix = text[:idx].strip() if idx > 0 else ""
+                # Strip markdown code fences around the JSON blob if any
+                prefix = re.sub(r"```(?:json)?\s*$", "", prefix).strip()
+                return result, (prefix or None)
+
+    # 2. Check for DeepSeek native DSML `<｜DSML｜...>` / `< | DSML | | ...>` calls
+    dsml_calls, cleaned = _parse_dsml_tool_calls(text)
+    if dsml_calls:
+        return dsml_calls, (cleaned or None)
+
+    return None, text
+
+
+def parse_tool_calls(text: str) -> Optional[List[dict]]:
+    """Extract tool calls from the model's raw text output."""
+    calls, _ = parse_tool_calls_with_text(text)
+    return calls
 
 
 def messages_to_prompt(
@@ -354,7 +429,7 @@ def completion_response(
     finish_reason = "stop"
     if tool_calls:
         message["tool_calls"] = tool_calls
-        message["content"] = None
+        message["content"] = content or None
         finish_reason = "tool_calls"
 
     return {
@@ -473,9 +548,11 @@ def stream_chunks(
 
     conversation_id = getattr(stream, "conversation_id", None)
     full_response = "".join(response_chunks)
-    tool_calls = parse_tool_calls(full_response)
+    tool_calls, pre_text = parse_tool_calls_with_text(full_response)
 
     if tool_calls:
+        if pre_text:
+            yield frame({"content": pre_text})
         indexed_calls = [
             {"index": idx, **tc}
             for idx, tc in enumerate(tool_calls)

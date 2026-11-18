@@ -44,7 +44,7 @@ from .openai_format import (
     completion_response,
     extract_images,
     messages_to_prompt,
-    parse_tool_calls,
+    parse_tool_calls_with_text,
     stream_chunks,
     stream_error,
 )
@@ -209,10 +209,12 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    tool_calls = parse_tool_calls(reply.text) if has_tools else None
+    tool_calls, cleaned_text = (
+        parse_tool_calls_with_text(reply.text) if has_tools else (None, reply.text)
+    )
     return completion_response(
         req.model,
-        reply.text,
+        cleaned_text or "",
         prompt,
         reply.conversation_id,
         reply.reasoning,
